@@ -2,30 +2,32 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"text/template"
+	"time"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/gorilla/sessions"
+	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 	"github.com/ugol/jr/pkg/configuration"
 	"github.com/ugol/jr/pkg/constants"
 	"github.com/ugol/jr/pkg/emitter"
 	"github.com/ugol/jr/pkg/functions"
-	"log"
-	"net/http"
-	"path/filepath"
-	"strings"
-	"text/template"
-	"time"
 )
 
 //go:embed html/index.html
 var index_html string
-
-//go:embed html/emitters.html
-var emitters_html string
 
 //go:embed html/templatedev.html
 var templatedev_html string
@@ -63,11 +65,10 @@ var font_awesome_js string
 //go:embed html/images/jr_logo.png
 var jr_logo_png []byte
 
-var lastTemplateSubmittedValue []byte
-var lastTemplateSubmittedisJsonOutputValue []byte
-
 var firstRun = make(map[string]bool)
 var emitterToRun = make(map[string][]emitter.Emitter)
+
+var store = sessions.NewCookieStore([]byte("templates"))
 
 var serverCmd = &cobra.Command{
 	Use:     "server",
@@ -78,7 +79,7 @@ var serverCmd = &cobra.Command{
 
 		port, err := cmd.Flags().GetInt("port")
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal().Err(err).Msg("Error getting port")
 		}
 
 		for i := 0; i < len(emitters); i++ {
@@ -95,6 +96,7 @@ var serverCmd = &cobra.Command{
 		router.Use(middleware.Logger)
 		router.Use(middleware.Recoverer)
 		router.Use(middleware.Timeout(60 * time.Second))
+		router.Use(SessionMiddleware)
 
 		//comment for local dev
 		embeddedFileRoutes(router)
@@ -130,9 +132,17 @@ var serverCmd = &cobra.Command{
 		})
 
 		addr := fmt.Sprintf(":%d", port)
-		log.Printf("Starting HTTP server on port %d\n", port)
-		log.Fatal(http.ListenAndServe(addr, router))
+		log.Info().Int("port", port).Msg("Starting HTTP server")
+		log.Fatal().Err(http.ListenAndServe(addr, router))
 	},
+}
+
+func SessionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		session, _ := store.Get(r, "session-name")
+		r = r.WithContext(context.WithValue(r.Context(), "session", session))
+		next.ServeHTTP(w, r)
+	})
 }
 
 func embeddedFileRoutes(router chi.Router) {
@@ -143,10 +153,6 @@ func embeddedFileRoutes(router chi.Router) {
 
 	router.Get("/index.html", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(index_html))
-	})
-
-	router.Get("/emitters.html", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(emitters_html))
 	})
 
 	router.Get("/templatedev.html", func(w http.ResponseWriter, r *http.Request) {
@@ -236,7 +242,7 @@ func listEmitters(w http.ResponseWriter, r *http.Request) {
 
 	_, err := w.Write([]byte(emitters_json))
 	if err != nil {
-		log.Println(err)
+		log.Error().Err(err).Msg("Error writing response")
 	}
 }
 
@@ -267,7 +273,7 @@ func addEmitter(w http.ResponseWriter, r *http.Request) {
 	response := fmt.Sprintf("Emitter %s added", e.Name)
 	_, err = w.Write([]byte(response))
 	if err != nil {
-		log.Println(err)
+		log.Error().Err(err).Msg("Error writing response")
 	}
 }
 
@@ -285,9 +291,8 @@ func startEmitter(w http.ResponseWriter, r *http.Request) {
 	url := chi.URLParam(r, "emitter")
 
 	_, err := w.Write([]byte("{\"started\":\"" + url + "\"}"))
-
 	if err != nil {
-		log.Println(err)
+		log.Error().Err(err).Msg("Error writing response")
 	}
 }
 
@@ -297,9 +302,8 @@ func stopEmitter(w http.ResponseWriter, r *http.Request) {
 	url := chi.URLParam(r, "emitter")
 
 	_, err := w.Write([]byte("{\"stopped\":\"" + url + "\"}"))
-
 	if err != nil {
-		log.Println(err)
+		log.Error().Err(err).Msg("Error writing response")
 	}
 }
 
@@ -309,9 +313,8 @@ func pauseEmitter(w http.ResponseWriter, r *http.Request) {
 	url := chi.URLParam(r, "emitter")
 
 	_, err := w.Write([]byte("{\"paused\":\"" + url + "\"}"))
-
 	if err != nil {
-		log.Println(err)
+		log.Error().Err(err).Msg("Error writing response")
 	}
 }
 
@@ -346,9 +349,8 @@ func statusEmitter(w http.ResponseWriter, r *http.Request) {
 	url := chi.URLParam(r, "emitter")
 
 	_, err := w.Write([]byte("{\"status\":\"" + url + "\"}"))
-
 	if err != nil {
-		log.Println(err)
+		log.Error().Err(err).Msg("Error writing response")
 	}
 }
 
@@ -357,33 +359,47 @@ func loadLastStatus(w http.ResponseWriter, r *http.Request) {
 	var response bytes.Buffer
 
 	response.WriteString("{")
-	lastTemplateSubmittedValueB64 := base64.StdEncoding.EncodeToString(lastTemplateSubmittedValue)
+
+	session := r.Context().Value("session").(*sessions.Session)
+	lastTemplateSubmittedValue_without_type, _ := session.Values["lastTemplateSubmittedValue"]
+	lastTemplateSubmittedValue, _ := lastTemplateSubmittedValue_without_type.(string)
+
+	lastTemplateSubmittedisJsonOutputValue_without_type, _ := session.Values["lastTemplateSubmittedisJsonOutputValue"]
+	lastTemplateSubmittedisJsonOutputValue, _ := lastTemplateSubmittedisJsonOutputValue_without_type.(string)
+
+	lastTemplateSubmittedValueB64 := base64.StdEncoding.EncodeToString([]byte(lastTemplateSubmittedValue))
+
 	response.WriteString("\"template\": \"" + lastTemplateSubmittedValueB64 + "\",")
-	response.WriteString("\"isJsonOutput\": \"" + string(lastTemplateSubmittedisJsonOutputValue) + "\"")
+	response.WriteString("\"isJsonOutput\": \"" + lastTemplateSubmittedisJsonOutputValue + "\"")
 	response.WriteString("}")
 
 	_, err := w.Write(response.Bytes())
 	if err != nil {
-		log.Println(err)
+		log.Error().Err(err).Msg("Error writing response")
 	}
 }
 
 func executeTemplate(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "plain/text")
+
 	errorFormParse := r.ParseForm()
 	if errorFormParse != nil {
-		log.Println("errorFormParse ", errorFormParse)
+		log.Error().Err(errorFormParse).Msg("Error parsing form")
 		http.Error(w, errorFormParse.Error(), http.StatusInternalServerError)
 	}
 
-	lastTemplateSubmittedValue = []byte(r.Form.Get("template"))
-	lastTemplateSubmittedisJsonOutputValue = []byte(r.Form.Get("isJsonOutput"))
+	var lastTemplateSubmittedValue = r.Form.Get("template")
+	var lastTemplateSubmittedisJsonOutputValue = r.Form.Get("isJsonOutput")
 
-	templateParsed, errValidity := template.New("").Funcs(functions.FunctionsMap()).Parse(string(lastTemplateSubmittedValue))
+	session := r.Context().Value("session").(*sessions.Session)
+	session.Values["lastTemplateSubmittedValue"] = lastTemplateSubmittedValue
+	session.Values["lastTemplateSubmittedisJsonOutputValue"] = lastTemplateSubmittedisJsonOutputValue
+	session.Save(r, w)
 
+	templateParsed, errValidity := template.New("").Funcs(functions.FunctionsMap()).Parse(lastTemplateSubmittedValue)
 	if errValidity != nil {
-		log.Println("errValidity ", errValidity)
+		log.Error().Err(errValidity).Msg("Error parsing template")
 		http.Error(w, errValidity.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -393,15 +409,14 @@ func executeTemplate(w http.ResponseWriter, r *http.Request) {
 	errValidityRendering := templateParsed.Execute(&b, dummy)
 
 	if errValidityRendering != nil {
-		log.Println("errValidityRendering = ", errValidityRendering)
+		log.Error().Err(errValidityRendering).Msg("Error rendering template")
 		http.Error(w, errValidityRendering.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	_, err := w.Write([]byte(b.String()))
-
 	if err != nil {
-		log.Println(err)
+		log.Error().Err(err).Msg("Error writing response")
 	}
 
 }
@@ -417,23 +432,67 @@ func webFunctionList(w http.ResponseWriter, r *http.Request) {
 }
 
 func webPrintFunction(web_function_to_find string, w http.ResponseWriter, r *http.Request) {
-	f, found := functions.Description(web_function_to_find)
 
-	if found {
-		b, errMarshal := json.Marshal(f)
-		if errMarshal != nil {
-			fmt.Println(errMarshal)
-			return
-		}
+	matchingFunction := findFunctonsByRegex(web_function_to_find)
+
+	sort.Strings(matchingFunction)
+
+	if len(matchingFunction) > 0 {
+
+		buffer := bytes.Buffer{}
 		w.Header().Set("Content-Type", "application/json")
-		_, err := w.Write(b)
-		if err != nil {
-			log.Println(err)
+
+		buffer.WriteString("{\"functions\":[")
+
+		for i, function_name := range matchingFunction {
+
+			f, _ := functions.Description(function_name)
+
+			b, errMarshal := json.Marshal(f)
+			if errMarshal != nil {
+				log.Error().Err(errMarshal).Msg("Error marshalling function")
+				return
+			}
+
+			buffer.Write(b)
+
+			if i < len(matchingFunction)-1 {
+				buffer.WriteString(",")
+			}
+
 		}
+
+		buffer.WriteString("]}")
+
+		_, err := w.Write(buffer.Bytes())
+		if err != nil {
+			log.Error().Err(err).Msg("Error writing response")
+		}
+
 	} else {
 		http.Error(w, "No function found", http.StatusNotFound)
 	}
 
+}
+
+func findFunctonsByRegex(name string) []string {
+	var matchedKeys []string
+
+	// Compile the regular expression pattern
+	re, err := regexp.Compile(name)
+	if err != nil {
+		fmt.Println("Invalid regex pattern:", err)
+		return nil
+	}
+
+	// Iterate over the map and match the keys against the regex pattern
+	for key := range functions.DescriptionMap() {
+		if re.MatchString(key) {
+			matchedKeys = append(matchedKeys, key)
+		}
+	}
+
+	return matchedKeys
 }
 
 func init() {

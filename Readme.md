@@ -10,7 +10,7 @@ JR is a CLI program that helps you to stream quality random data for your applic
 ![Build](https://github.com/ugol/jr/actions/workflows/go-mac.yml/badge.svg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Go Reference](https://pkg.go.dev/badge/github.com/ugol/jr.svg)](https://pkg.go.dev/github.com/ugol/jr)
-[![Docker](https://img.shields.io/badge/docker-latest-blue.svg)](https://hub.docker.com/r/ugol/jr)
+[![Docker](https://img.shields.io/badge/docker-latest-blue.svg)](https://hub.docker.com/r/jrndio/jr)
 
 ![JR-simple](https://user-images.githubusercontent.com/89472/229626362-70ddc95d-1090-4746-a20a-fbffba4193cd.gif)
 
@@ -50,10 +50,10 @@ JR is very straightforward to use. Here are some examples:
 ```bash
 jr template list
 ````
-Templates are in the directory `$JR_HOME/templates`. JR_HOME defaults to `~/.jr` and can be changed to a different dir, for example:
+Templates are in the directory `$JR_SYSTEM_DIR/templates`. JR_SYSTEM_DIR defaults to `$XDG_CONFIGDIR` and can be changed to a different dir, for example:
 
 ```bash
-JR_HOME=~/jrconfig/ jr template list
+JR_SYSTEM_DIR=~/jrconfig/ jr template list
 ````
 
 Templates with parsing issues are showed in <font color='red'>red</font>, Templates with no parsing issues are showed in <font color='green'>green</font>
@@ -74,11 +74,11 @@ jr run net_device
 
 ### Using Docker
 
-You can also use a [![Docker](https://img.shields.io/badge/docker-latest-blue.svg)](https://hub.docker.com/r/ugol/jr)
+You can also use a [![Docker](https://img.shields.io/badge/docker-latest-blue.svg)](https://hub.docker.com/r/jrndio/jr)
 image if you prefer.
 
 ```bash
-docker run -it ugol/jr:latest jr run net_device
+docker run -it jrndio/jr:latest jr run net_device
 ```
 
 ### Other options for templates
@@ -141,3 +141,11 @@ jr run net_device -n 2 -f 100ms -d 1m --kcat | jq
 
 parse error: Expected value before ',' at line 1, column 5
 ```
+
+## Distributed Testing
+
+JR can be run as a distributed data generation. 
+At the moment the following testing tools are supported:
+
+- [k6](./k6/exec/)
+- [locust](./locust/)

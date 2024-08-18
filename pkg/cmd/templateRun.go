@@ -21,20 +21,22 @@
 package cmd
 
 import (
+	"time"
+
+	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/ugol/jr/pkg/configuration"
 	"github.com/ugol/jr/pkg/constants"
 	"github.com/ugol/jr/pkg/emitter"
 	"github.com/ugol/jr/pkg/functions"
-	"time"
 )
 
 var templateRunCmd = &cobra.Command{
 	Use:   "run [template]",
 	Short: "Execute a template",
 	Long: `Execute a template. 
-  Without any other flag, [template] is just the name of a template in the templates directory, which is '$JR_HOME/templates'. Example: 
+  Without any other flag, [template] is just the name of a template in the templates directory, which is '$JR_SYSTEM_DIR/templates'. Example: 
 jr template run net_device
   With the --embedded flag, [template] is a string containing a full template. Example:
 jr template run --template "{{name}}"
@@ -53,7 +55,7 @@ jr template run --template "{{name}}"
 		num, _ := cmd.Flags().GetInt("num")
 		frequency, _ := cmd.Flags().GetDuration("frequency")
 		duration, _ := cmd.Flags().GetDuration("duration")
-		//throughputString, _ := cmd.Flags().GetString("throughput")
+		throughputString, _ := cmd.Flags().GetString("throughput")
 		seed, _ := cmd.Flags().GetInt64("seed")
 		topic, _ := cmd.Flags().GetString("topic")
 		preload, _ := cmd.Flags().GetInt("preload")
@@ -74,16 +76,16 @@ jr template run --template "{{name}}"
 			vTemplate = args[0]
 			eTemplate = ""
 		}
-		/*
-			throughput, err := parseThroughput(throughputString)
-			if err != nil {
-				log.Panicf("Throughput format error:%v", err)
-			}
 
-			if throughput > 0 {
-				// @TODO
-			}
-		*/
+		throughput, err := emitter.ParseThroughput(throughputString)
+		if err != nil {
+			log.Panic().Err(err).Msg("Throughput format error")
+		}
+
+		if throughput > 0 {
+			// @TODO
+		}
+
 		cmd.Flags().VisitAll(func(f *pflag.Flag) {
 			if f.Changed {
 				switch f.Name {
@@ -109,12 +111,14 @@ jr template run --template "{{name}}"
 					configuration.GlobalCfg.S3Config, _ = cmd.Flags().GetString(f.Name)
 				case "gcsConfig":
 					configuration.GlobalCfg.GCSConfig, _ = cmd.Flags().GetString(f.Name)
+				case "httpConfig":
+					configuration.GlobalCfg.HTTPConfig, _ = cmd.Flags().GetString(f.Name)
 				}
 			}
 		})
 
 		e := emitter.Emitter{
-			Name:             "cli",
+			Name:             constants.DEFAULT_EMITTER_NAME,
 			Locale:           locale,
 			Num:              num,
 			Frequency:        frequency,
@@ -132,7 +136,7 @@ jr template run --template "{{name}}"
 		}
 
 		functions.SetSeed(seed)
-		es := map[string][]emitter.Emitter{"cli": {e}}
+		es := map[string][]emitter.Emitter{constants.DEFAULT_EMITTER_NAME: {e}}
 		RunEmitters([]string{e.Name}, es, false)
 	},
 }
@@ -166,6 +170,7 @@ func init() {
 	templateRunCmd.Flags().BoolP("schemaRegistry", "s", false, "If you want to use Confluent Schema Registry")
 	templateRunCmd.Flags().String("serializer", "", "Type of serializer: json-schema, avro-generic, avro, protobuf")
 	templateRunCmd.Flags().Duration("redis.ttl", -1, "If output is redis, ttl of the object")
+	templateRunCmd.Flags().String("httpConfig", "", "HTTP configuration")
 	templateRunCmd.Flags().String("redisConfig", "", "Redis configuration")
 	templateRunCmd.Flags().String("mongoConfig", "", "MongoDB configuration")
 	templateRunCmd.Flags().String("elasticConfig", "", "Elastic Search configuration")

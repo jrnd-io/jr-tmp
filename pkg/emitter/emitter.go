@@ -22,6 +22,10 @@ package emitter
 
 import (
 	"fmt"
+	"os"
+	"time"
+
+	"github.com/rs/zerolog/log"
 	"github.com/ugol/jr/pkg/configuration"
 	"github.com/ugol/jr/pkg/constants"
 	"github.com/ugol/jr/pkg/ctx"
@@ -29,15 +33,13 @@ import (
 	"github.com/ugol/jr/pkg/producers/console"
 	"github.com/ugol/jr/pkg/producers/elastic"
 	"github.com/ugol/jr/pkg/producers/gcs"
+	"github.com/ugol/jr/pkg/producers/http"
 	"github.com/ugol/jr/pkg/producers/kafka"
 	"github.com/ugol/jr/pkg/producers/mongoDB"
 	"github.com/ugol/jr/pkg/producers/redis"
 	"github.com/ugol/jr/pkg/producers/s3"
 	"github.com/ugol/jr/pkg/producers/server"
 	"github.com/ugol/jr/pkg/tpl"
-	"log"
-	"os"
-	"time"
 )
 
 type Emitter struct {
@@ -67,7 +69,7 @@ func (e *Emitter) Initialize(conf configuration.GlobalConfiguration) {
 
 	templateName := e.ValueTemplate
 	if e.EmbeddedTemplate == "" {
-		path := os.ExpandEnv(fmt.Sprintf("%s/%s", constants.JRhome, "templates"))
+		path := os.ExpandEnv(fmt.Sprintf("%s/%s", constants.JR_SYSTEM_DIR, "templates"))
 		templateFullPath := fmt.Sprintf("%s/%s.tpl", path, templateName)
 		vt, err := os.ReadFile(templateFullPath)
 		e.EmbeddedTemplate = string(vt)
@@ -78,11 +80,11 @@ func (e *Emitter) Initialize(conf configuration.GlobalConfiguration) {
 
 	keyTpl, err := tpl.NewTpl("key", e.KeyTemplate, functions.FunctionsMap(), &ctx.JrContext)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal().Err(err).Msg("Failed to create key template")
 	}
 	valueTpl, err := tpl.NewTpl("value", e.EmbeddedTemplate, functions.FunctionsMap(), &ctx.JrContext)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal().Err(err).Msg("Failed to create value template")
 	}
 
 	e.KTpl = keyTpl
@@ -99,7 +101,7 @@ func (e *Emitter) Initialize(conf configuration.GlobalConfiguration) {
 		return
 	} else {
 		if conf.SchemaRegistry {
-			log.Println("Ignoring schemaRegistry and/or serializer when output not set to kafka")
+			log.Warn().Msg("Ignoring schemaRegistry and/or serializer when output not set to kafka")
 		}
 	}
 
@@ -128,8 +130,13 @@ func (e *Emitter) Initialize(conf configuration.GlobalConfiguration) {
 		return
 	}
 
-	if e.Output == "http" {
+	if e.Output == "json" {
 		e.Producer = &server.JsonProducer{OutputTpl: &o}
+		return
+	}
+
+	if e.Output == "http" {
+		e.Producer = createHTTPProducer(conf.HTTPConfig)
 		return
 	}
 
@@ -138,11 +145,19 @@ func (e *Emitter) Initialize(conf configuration.GlobalConfiguration) {
 func (e *Emitter) Run(num int, o any) {
 
 	for i := 0; i < num; i++ {
+
 		k := e.KTpl.Execute()
 		v := e.VTpl.Execute()
-		e.Producer.Produce([]byte(k), []byte(v), o)
+		kInValue := functions.GetV("KEY")
+
+		if kInValue != "" {
+			e.Producer.Produce([]byte(kInValue), []byte(v), o)
+		} else {
+			e.Producer.Produce([]byte(k), []byte(v), o)
+		}
 		ctx.JrContext.GeneratedObjects++
 		ctx.JrContext.GeneratedBytes += int64(len(v))
+
 	}
 
 }
@@ -181,6 +196,13 @@ func createGCSProducer(gcsConfig string) Producer {
 	gProducer.Initialize(gcsConfig)
 
 	return gProducer
+}
+
+func createHTTPProducer(httpConfig string) Producer {
+	httpProducer := &http.Producer{}
+	httpProducer.Initialize(httpConfig)
+
+	return httpProducer
 }
 
 func createKafkaProducer(conf configuration.GlobalConfiguration, topic string, templateType string) *kafka.KafkaManager {

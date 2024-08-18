@@ -25,17 +25,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
-	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde"
-	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde/avro"
-	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde/jsonschema"
-	"github.com/ugol/jr/pkg/types"
-	"log"
+	"io"
 	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/rules/encryption"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/rules/encryption/awskms"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/rules/encryption/azurekms"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/rules/encryption/gcpkms"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/rules/encryption/hcvault"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde/avrov2"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde/jsonschema"
+	"github.com/ugol/jr/pkg/types"
+
+	"github.com/rs/zerolog/log"
 )
 
 type KafkaManager struct {
@@ -46,6 +57,7 @@ type KafkaManager struct {
 	Topic          string
 	Serializer     string
 	TemplateType   string
+	fleEnabled     bool
 }
 
 func (k *KafkaManager) Initialize(configFile string) {
@@ -54,11 +66,11 @@ func (k *KafkaManager) Initialize(configFile string) {
 	conf := convertInKafkaConfig(readConfig(configFile))
 	k.admin, err = kafka.NewAdminClient(&conf)
 	if err != nil {
-		log.Fatalf("Failed to create admin client: %s", err)
+		log.Fatal().Err(err).Msg("Failed to create admin client")
 	}
 	k.producer, err = kafka.NewProducer(&conf)
 	if err != nil {
-		log.Fatalf("Failed to create producer: %s", err)
+		log.Fatal().Err(err).Msg("Failed to create producer")
 	}
 }
 
@@ -72,10 +84,98 @@ func (k *KafkaManager) InitializeSchemaRegistry(configFile string) {
 		conf["schemaRegistryPassword"]))
 
 	if err != nil {
-		log.Fatalf("Failed to create schema registry client: %s", err)
+		log.Fatal().Err(err).Msg("Failed to create schema registry client")
+	}
+
+	if k.Serializer == "avro" || k.Serializer == "avro-generic" {
+		verifyCSFLE(conf, k)
 	}
 
 	k.schemaRegistry = true
+}
+
+func verifyCSFLE(conf map[string]string, k *KafkaManager) {
+	if conf["kekName"] != "" && conf["kmsType"] != "" && conf["kmsKeyID"] != "" {
+		registerProviders()
+
+		// load avro schema file: CSFLE requires schema registration
+		_, currentFilePath, _, _ := runtime.Caller(0)
+		currentDir := filepath.Dir(currentFilePath)
+		filePath := filepath.Join(currentDir, "../../types/"+k.TemplateType+".avsc")
+		file, err := os.Open(filePath)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to open file")
+		}
+		defer file.Close()
+
+		content, err := io.ReadAll(file)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to read file")
+		}
+		contentString := string(content)
+
+		// check presence of PII in schema
+		substring := `"confluent:tags": [ "PII" ]`
+		normalizedJSON := normalizeWhitespace(contentString)
+		normalizedSubstring := normalizeWhitespace(substring)
+
+		if strings.Contains(normalizedJSON, normalizedSubstring) {
+			// upper-casing the first letter of the fields --> name - required by https://pkg.go.dev/github.com/actgardner/gogen-avro#readme-naming
+			re := regexp.MustCompile(`"name"\s*:\s*"([^"]+)"`)
+			result := re.ReplaceAllStringFunc(contentString, func(match string) string {
+				// extract the name part after "name: "
+				parts := re.FindStringSubmatch(match)
+				fmt.Print(len(parts))
+				if len(parts) > 1 {
+					name := parts[1]
+					// capitalize the first letter of the name
+					capitalized := capitalizeFirstLetter(name)
+					// replace the original match with the new capitalized version
+					return "\"name\":" + "\"" + capitalized + "\""
+				}
+				return match
+			})
+
+			// register the avro schema adding rule set: PII
+			schema := schemaregistry.SchemaInfo{
+				Schema:     result,
+				SchemaType: "AVRO",
+				RuleSet: &schemaregistry.RuleSet{
+					DomainRules: []schemaregistry.Rule{
+						{
+							Name: "encryptPII",
+							Kind: "TRANSFORM",
+							Mode: "WRITEREAD",
+							Type: "ENCRYPT",
+							Tags: []string{"PII"},
+							Params: map[string]string{
+								"encrypt.kek.name":   conf["kekName"],
+								"encrypt.kms.type":   conf["kmsType"],
+								"encrypt.kms.key.id": conf["kmsKeyID"],
+							},
+							OnFailure: "ERROR,NONE",
+						},
+					},
+				},
+			}
+			_, err = k.schema.Register(k.Topic+"-value", schema, true)
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to register schema")
+			}
+
+			k.fleEnabled = true
+
+		}
+
+	}
+}
+
+func registerProviders() {
+	awskms.Register()
+	azurekms.Register()
+	gcpkms.Register()
+	hcvault.Register()
+	encryption.Register()
 }
 
 func (k *KafkaManager) Close() error {
@@ -93,35 +193,41 @@ func (k *KafkaManager) Produce(key []byte, data []byte, o any) {
 
 	if k.schemaRegistry {
 		var err error
-		if k.Serializer == "avro" {
-			ser, err = avro.NewSpecificSerializer(k.schema, serde.ValueSerde, avro.NewSerializerConfig())
-		} else if k.Serializer == "avro-generic" {
-			ser, err = avro.NewGenericSerializer(k.schema, serde.ValueSerde, avro.NewSerializerConfig())
+
+		if k.Serializer == "avro" || k.Serializer == "avro-generic" {
+			serConfig := avrov2.NewSerializerConfig()
+			// CSFLE requires auto register to false
+			if k.fleEnabled {
+				serConfig.AutoRegisterSchemas = false
+				serConfig.UseLatestVersion = true
+			}
+			ser, err = avrov2.NewSerializer(k.schema, serde.ValueSerde, serConfig)
 		} else if k.Serializer == "protobuf" {
 			//ser, err = protobuf.NewSerializer(k.schema, serde.ValueSerde, protobuf.NewSerializerConfig())
-			log.Fatal("Protobuf not yet implemented")
+			log.Fatal().Msg("Protobuf not yet implemented")
 		} else if k.Serializer == "json-schema" {
 			ser, err = jsonschema.NewSerializer(k.schema, serde.ValueSerde, jsonschema.NewSerializerConfig())
 		} else {
-			log.Fatalf("Serializer '%v' not supported", k.Serializer)
+			log.Fatal().Str("serializer", k.Serializer).Msg("Serializer not supported")
 		}
 		if err != nil {
-			log.Fatalf("Error creating serializer: %s\n", err)
+			log.Fatal().Err(err).Msg("Error creating serializer")
 		} else {
 
 			t := types.GetType(k.TemplateType)
 			err := json.Unmarshal(data, &t)
 
 			if err != nil {
-				log.Fatalf("Failed to unmarshal data: %s\n", err)
+				log.Fatal().Err(err).Msg("Failed to unmarshal data")
 			}
 
 			payload, err := ser.Serialize(k.Topic, t)
 			if err != nil {
-				log.Fatalf("Failed to serialize payload: %s\n", err)
+				log.Fatal().Err(err).Msg("Failed to serialize payload")
 			} else {
 				data = payload
 			}
+
 		}
 	}
 
@@ -143,7 +249,7 @@ func (k *KafkaManager) Produce(key []byte, data []byte, o any) {
 			//time.Sleep(time.Second)
 			//continue
 		}
-		log.Printf("Failed to produce message: %v\n", err)
+		log.Error().Err(err).Msg("Failed to produce message")
 	}
 
 }
@@ -171,14 +277,18 @@ func (k *KafkaManager) CreateTopicFull(topic string, partitions int, rf int) {
 		kafka.SetAdminOperationTimeout(maxDuration))
 
 	if err != nil {
-		log.Printf("Problem during the topic creation: %v\n", err)
+		log.Error().Err(err).Msg("Problem during the topic creation")
 
 	}
 
 	// Check for specific topic errors
 	for _, result := range results {
 		if result.Error.Code() != kafka.ErrNoError && result.Error.Code() != kafka.ErrTopicAlreadyExists {
-			log.Fatalf("Topic creation failed for %s: %v", result.Topic, result.Error.String())
+			log.Fatal().
+				Str("topic", result.Topic).
+				Str("code", result.Error.Code().String()).
+				Err(fmt.Errorf(result.Error.String())).
+				Msg("Topic creation failed")
 		}
 	}
 
@@ -193,12 +303,12 @@ func listenToEventsFrom(k *kafka.Producer, topic string) {
 		case *kafka.Message:
 			m := ev
 			if m.TopicPartition.Error != nil {
-				log.Printf("Delivery failed: %v\n", m.TopicPartition.Error)
+				log.Error().Err(m.TopicPartition.Error).Msg("Delivery failed")
 			} else {
 				//fmt.Printf("Delivered message to topic %s [%d] at offset %v\n", *m.TopicPartition.Topic, m.TopicPartition.Partition, m.TopicPartition.Offset)
 			}
 		case kafka.Error:
-			log.Printf("Error: %v\n", ev)
+			log.Error().Err(ev).Msg("Kafka error")
 		case *kafka.Stats:
 			// https://github.com/confluentinc/librdkafka/blob/master/STATISTICS.md
 			var stats map[string]interface{}
@@ -210,10 +320,13 @@ func listenToEventsFrom(k *kafka.Producer, topic string) {
 			b, _ := strconv.Atoi(strings.TrimSpace(txbytes))
 
 			if b > 0 {
-				log.Printf("%s bytes produced to topic %s \n", txbytes, topic)
+				log.Info().
+					Str("bytes", txbytes).
+					Str("topic", topic).
+					Msg("Bytes produced to topic")
 			}
 		default:
-			log.Printf("Ignored event: %s\n", ev)
+			log.Warn().Interface("ev", ev).Msg("Ignored event")
 		}
 	}
 
@@ -225,12 +338,12 @@ func readConfig(configFile string) map[string]string {
 
 	file, err := os.Open(configFile)
 	if err != nil {
-		log.Fatalf("Failed to open file: %s", err)
+		log.Fatal().Err(err).Msg("Failed to open configuration file")
 	}
 	defer func(file *os.File) {
 		err := file.Close()
 		if err != nil {
-			log.Fatalf("Error in closing file: %s", err)
+			log.Fatal().Err(err).Msg("Error in closing file")
 		}
 	}(file)
 
@@ -246,7 +359,7 @@ func readConfig(configFile string) map[string]string {
 	}
 
 	if err := scanner.Err(); err != nil {
-		log.Fatalf("Failed to read file: %s", err)
+		log.Fatal().Err(err).Msg("Failed to read file")
 	}
 	return m
 }
@@ -258,4 +371,16 @@ func convertInKafkaConfig(m map[string]string) kafka.ConfigMap {
 		conf[k] = v
 	}
 	return conf
+}
+
+func capitalizeFirstLetter(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	return strings.ToUpper(string(s[0])) + s[1:]
+}
+
+func normalizeWhitespace(s string) string {
+	re := regexp.MustCompile(`\s+`)
+	return re.ReplaceAllString(s, " ")
 }
