@@ -30,6 +30,9 @@ import (
 	"github.com/ugol/jr/pkg/constants"
 	"github.com/ugol/jr/pkg/ctx"
 	"github.com/ugol/jr/pkg/functions"
+	"github.com/ugol/jr/pkg/producers/azblobstorage"
+	"github.com/ugol/jr/pkg/producers/azcosmosdb"
+	"github.com/ugol/jr/pkg/producers/cassandra"
 	"github.com/ugol/jr/pkg/producers/console"
 	"github.com/ugol/jr/pkg/producers/elastic"
 	"github.com/ugol/jr/pkg/producers/gcs"
@@ -130,6 +133,15 @@ func (e *Emitter) Initialize(conf configuration.GlobalConfiguration) {
 		return
 	}
 
+	if e.Output == "azblobstorage" {
+		e.Producer = createAZBlobStorageProducer(conf.AzBlobStorageConfig)
+		return
+	}
+	if e.Output == "azcosmosdb" {
+		e.Producer = createAZCosmosDBProducer(conf.AzCosmosDBConfig)
+		return
+	}
+
 	if e.Output == "json" {
 		e.Producer = &server.JsonProducer{OutputTpl: &o}
 		return
@@ -137,6 +149,11 @@ func (e *Emitter) Initialize(conf configuration.GlobalConfiguration) {
 
 	if e.Output == "http" {
 		e.Producer = createHTTPProducer(conf.HTTPConfig)
+		return
+	}
+
+	if e.Output == "cassandra" {
+		e.Producer = createCassandraProducer(conf.CassandraConfig)
 		return
 	}
 
@@ -191,6 +208,20 @@ func createS3Producer(s3Config string) Producer {
 	return sProducer
 }
 
+func createAZBlobStorageProducer(azConfig string) Producer {
+	producer := &azblobstorage.Producer{}
+	producer.Initialize(azConfig)
+
+	return producer
+}
+
+func createAZCosmosDBProducer(azConfig string) Producer {
+	producer := &azcosmosdb.Producer{}
+	producer.Initialize(azConfig)
+
+	return producer
+}
+
 func createGCSProducer(gcsConfig string) Producer {
 	gProducer := &gcs.GCSProducer{}
 	gProducer.Initialize(gcsConfig)
@@ -203,6 +234,13 @@ func createHTTPProducer(httpConfig string) Producer {
 	httpProducer.Initialize(httpConfig)
 
 	return httpProducer
+}
+
+func createCassandraProducer(config string) Producer {
+	producer := &cassandra.Producer{}
+	producer.Initialize(config)
+
+	return producer
 }
 
 func createKafkaProducer(conf configuration.GlobalConfiguration, topic string, templateType string) *kafka.KafkaManager {
